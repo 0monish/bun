@@ -203,6 +203,9 @@ static PUBLISH_PARAMS: &[ParamType] = concat_params![SHARED_PARAMS, &[
     clap::param!("--auth-type <STR>                      Specify the type of one-time password authentication (default is 'web')"),
     clap::param!("--gzip-level <STR>                     Specify a custom compression level for gzip. Default is 9."),
     clap::param!("--tolerate-republish                   Don't exit with code 1 when republishing over an existing version number"),
+    clap::param!("--provenance                           Generate a signed provenance statement (GitHub Actions / GitLab CI only)"),
+    clap::param!("--no-provenance                        Do not generate a provenance statement"),
+    clap::param!("--provenance-file <STR>                Path to an externally-generated Sigstore provenance bundle to attach"),
 ]];
 
 static WHY_PARAMS: &[ParamType] = concat_params![SHARED_PARAMS, &[
@@ -1058,6 +1061,19 @@ Full documentation is available at <magenta>https://bun.com/docs/cli/pm#scan<r>.
             }
 
             cli.tolerate_republish = args.flag(b"--tolerate-republish");
+
+            // `--provenance` / `--no-provenance` — tri-state so a future
+            // `publishConfig.provenance` or `NPM_CONFIG_PROVENANCE` default
+            // can be overridden from the CLI in either direction.
+            if args.flag(b"--no-provenance") {
+                cli.publish_config.provenance = Some(false);
+            }
+            if args.flag(b"--provenance") {
+                cli.publish_config.provenance = Some(true);
+            }
+            if let Some(path) = args.option(b"--provenance-file") {
+                cli.publish_config.provenance_file = path;
+            }
         }
 
         // link and unlink default to not saving, all others default to
