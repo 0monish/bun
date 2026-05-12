@@ -680,8 +680,8 @@ impl<'src> HtmlRenderer<'src> {
     }
 
     fn write_decimal(&mut self, value: u32) {
-        let mut buf = [0u8; 20];
-        self.write(bun_core::fmt::itoa_u64(&mut buf, u64::from(value)));
+        let mut buf = bun_core::fmt::ItoaBuf::new();
+        self.write(bun_core::fmt::itoa(&mut buf, value));
     }
 }
 

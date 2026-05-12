@@ -581,6 +581,7 @@ dependencies = [
  "bun_windows_sys",
  "bytemuck",
  "const_format",
+ "itoa",
  "libc",
  "parking_lot",
  "phf 0.11.3",
@@ -2074,6 +2075,7 @@ dependencies = [
 name = "bun_shim_impl"
 version = "0.0.0"
 dependencies = [
+ "bun_opaque",
  "bun_windows_sys",
  "bytemuck",
 ]
@@ -2188,6 +2190,7 @@ dependencies = [
  "bun_core",
  "bun_libuv_sys",
  "bun_sys",
+ "bun_windows_sys",
  "enumset",
  "libc",
  "scopeguard",
@@ -2361,7 +2364,6 @@ dependencies = [
  "const_format",
  "enum-map",
  "enumset",
- "itoa",
  "libc",
  "parking_lot",
  "phf 0.11.3",
@@ -2505,6 +2507,7 @@ dependencies = [
  "bun_http_types",
  "bun_libuv_sys",
  "bun_opaque",
+ "bun_paths",
  "bun_windows_sys",
  "const_format",
  "enum-map",

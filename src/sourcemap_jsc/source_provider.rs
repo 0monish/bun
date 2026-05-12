@@ -32,20 +32,9 @@ bun_opaque::opaque_ffi! {
 
 impl BakeSourceProvider {
     #[inline]
-    fn as_ffi_ptr(&self) -> *mut Self {
-        // SAFETY: opaque ZST handle — C++ owns the real storage and may mutate
-        // through this pointer (Zig spec passes `*BakeSourceProvider` everywhere).
-        // `UnsafeCell` at offset 0 grants interior-mutability provenance, so
-        // deriving `*mut Self` from `&self` is sound without a const→mut cast.
-        // Rust itself holds zero bytes here; the `*mut` exists solely to match
-        // C++'s non-const `BakeSourceProvider*` signatures.
-        self._p.get().cast::<Self>()
-    }
-
-    #[inline]
     pub fn get_source_slice(&self) -> BunString {
         // SAFETY: `self` is a live `*BakeSourceProvider` handed back to C++.
-        unsafe { BakeSourceProvider__getSourceSlice(self.as_ffi_ptr()) }
+        unsafe { BakeSourceProvider__getSourceSlice(self.as_mut_ptr()) }
     }
 
     pub fn to_source_content_ptr(&self) -> source_map::parsed_source_map::SourceContentPtr {
@@ -53,7 +42,7 @@ impl BakeSourceProvider {
         // can name the pointer without a tier-6 dep. Both are `#[repr(C)]` ZST opaques
         // for the same C++ type, so the pointer cast is layout-correct.
         source_map::parsed_source_map::SourceContentPtr::from_bake_provider(
-            self.as_ffi_ptr().cast::<source_map::BakeSourceProvider>(),
+            self.as_mut_ptr().cast::<source_map::BakeSourceProvider>(),
         )
     }
 

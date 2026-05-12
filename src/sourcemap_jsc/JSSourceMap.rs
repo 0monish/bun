@@ -204,17 +204,17 @@ impl JSSourceMap {
         // ownership transfers to the C++ JSCell wrapper (`m_ctx`). The extern takes
         // an erased `*mut ()` (matching `src/jsc/generated.rs::__create`) since
         // C++ stores it opaquely; cast back in `finalize`.
-        unsafe { SourceMap__create(global.as_ptr(), bun_core::heap::into_raw(this).cast::<()>()) }
+        unsafe { SourceMap__create(global.as_mut_ptr(), bun_core::heap::into_raw(this).cast::<()>()) }
     }
     #[inline]
     fn payload_set_cached(this_value: JSValue, global: &JSGlobalObject, value: JSValue) {
         // SAFETY: `global` is live; `this_value` is the freshly-constructed wrapper.
-        unsafe { SourceMapPrototype__payloadSetCachedValue(this_value, global.as_ptr(), value) };
+        unsafe { SourceMapPrototype__payloadSetCachedValue(this_value, global.as_mut_ptr(), value) };
     }
     #[inline]
     fn line_lengths_set_cached(this_value: JSValue, global: &JSGlobalObject, value: JSValue) {
         // SAFETY: `global` is live; `this_value` is the freshly-constructed wrapper.
-        unsafe { SourceMapPrototype__lineLengthsSetCachedValue(this_value, global.as_ptr(), value) };
+        unsafe { SourceMapPrototype__lineLengthsSetCachedValue(this_value, global.as_mut_ptr(), value) };
     }
 
     pub fn memory_cost(&self) -> usize {
@@ -283,7 +283,7 @@ impl JSSourceMap {
         // C++ callee may mutate the global without laundering a read-only pointer.
         Ok(unsafe {
             Bun__createNodeModuleSourceMapOriginObject(
-                global.as_ptr(),
+                global.as_mut_ptr(),
                 name,
                 JSValue::js_number(mapping.original.lines.zero_based() as f64),
                 JSValue::js_number(mapping.original.columns.zero_based() as f64),
@@ -314,7 +314,7 @@ impl JSSourceMap {
         // C++ callee may mutate the global without laundering a read-only pointer.
         Ok(unsafe {
             Bun__createNodeModuleSourceMapEntryObject(
-                global.as_ptr(),
+                global.as_mut_ptr(),
                 JSValue::js_number(mapping.generated.lines.zero_based() as f64),
                 JSValue::js_number(mapping.generated.columns.zero_based() as f64),
                 JSValue::js_number(mapping.original.lines.zero_based() as f64),
