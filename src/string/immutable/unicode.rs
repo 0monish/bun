@@ -411,7 +411,7 @@ pub(super) fn contains_non_bmp_code_point(text: &[u8]) -> bool {
     false
 }
 
-pub(super) fn contains_non_bmp_code_point_or_is_invalid_identifier(text: &[u8]) -> bool {
+pub fn contains_non_bmp_code_point_or_is_invalid_identifier(text: &[u8]) -> bool {
     let iter = CodepointIterator::init(text);
     let mut curs = Cursor::<CodePoint>::default();
 
@@ -517,11 +517,11 @@ pub fn to_utf8_list_with_type_bun<const SKIP_TRAILING_REPLACEMENT: bool>(
         #[cfg(not(target_family = "wasm"))]
         {
             let extra = ((utf16_remaining.len() as u64 & ((1u64 << 52) - 1)) as f64 * 1.2) as usize;
-            list.reserve_exact((i + count + list.len() + extra).saturating_sub(list.len()));
+            list.ensure_total_capacity_precise(i + count + list.len() + extra);
         }
         #[cfg(target_family = "wasm")]
         {
-            list.reserve_exact((i + count + list.len() + utf16_remaining.len() + 4).saturating_sub(list.len()));
+            list.ensure_total_capacity_precise(i + count + list.len() + utf16_remaining.len() + 4);
         }
         append_u16_as_u8(list, to_copy);
 
@@ -541,8 +541,7 @@ pub fn to_utf8_list_with_type_bun<const SKIP_TRAILING_REPLACEMENT: bool>(
     }
 
     if !utf16_remaining.is_empty() {
-        let need = utf16_remaining.len() + list.len();
-        list.reserve_exact(need.saturating_sub(list.len()));
+        list.ensure_total_capacity_precise(utf16_remaining.len() + list.len());
         append_u16_as_u8(list, utf16_remaining);
     }
 
@@ -1139,8 +1138,7 @@ pub(super) fn to_utf16_alloc<const FAIL_IF_INVALID: bool, const SENTINEL: bool>(
     }
 
     if !remaining.is_empty() {
-        let need = output.len() + remaining.len() + if SENTINEL { 1 } else { 0 };
-        output.reserve_exact(need.saturating_sub(output.len()));
+        output.ensure_total_capacity_precise(output.len() + remaining.len() + if SENTINEL { 1 } else { 0 });
 
         append_u8_as_u16(&mut output, remaining);
     }
@@ -1261,8 +1259,7 @@ pub fn to_utf16_alloc_maybe_buffered<const FAIL_IF_INVALID: bool, const FLUSH: b
     }
 
     if !remaining.is_empty() {
-        let need = output.len() + remaining.len();
-        output.reserve_exact(need.saturating_sub(output.len()));
+        output.ensure_total_capacity_precise(output.len() + remaining.len());
         append_u8_as_u16(&mut output, remaining);
     }
 

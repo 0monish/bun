@@ -1692,9 +1692,8 @@ pub mod color_map {
     }
 }
 
-pub use bun_output_tags::RESET;
-pub const BOLD: &str = "\x1b[1m";
-pub const DIM: &str = "\x1b[2m";
+pub use bun_output_tags::ansi;
+pub use ansi::{RESET, BOLD, DIM};
 
 /// `bun.Output.pretty(fmt, args)` — write to stdout with `<tag>` color expansion.
 /// Function form: performs the `<tag>` → ANSI rewrite at runtime on the rendered

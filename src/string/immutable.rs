@@ -34,7 +34,8 @@ pub use self::unicode::{
 // equivalent yet — re-export so downstream `bun_str::strings::*` callers (e.g.
 // runtime/webcore/encoding.rs) resolve. These return `bun_core::strings::EncodeIntoResult`.
 pub use unicode_draft::{
-    allocate_latin1_into_utf8, copy_cp1252_into_utf16, copy_latin1_into_ascii,
+    allocate_latin1_into_utf8, contains_non_bmp_code_point_or_is_invalid_identifier,
+    copy_cp1252_into_utf16, copy_latin1_into_ascii,
     copy_latin1_into_utf16, copy_latin1_into_utf8_stop_on_non_ascii, copy_u16_into_u8, copy_u8_into_u16,
     copy_utf16_into_utf8_impl, element_length_cp1252_into_utf16, element_length_utf8_into_utf16,
     replace_latin1_with_utf8, to_utf16_alloc_maybe_buffered, to_utf8_list_with_type_bun,
@@ -414,15 +415,10 @@ pub fn memmem(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     bstr::ByteSlice::find(haystack, needle)
 }
 
-/// `bun.reinterpretSlice` — `&[T]` → `&[u8]` view (T must be u8/u16 in practice).
-/// Safe via [`bun_core::cast_slice`]: the `NoUninit` bound proves every byte of
-/// `T` is initialized, and `u8` is `AnyBitPattern` with align 1.
-#[inline]
-fn reinterpret_to_u8<T: bun_core::NoUninit>(s: &[T]) -> &[u8] {
-    bun_core::cast_slice::<T, u8>(s)
-}
+// `bun.reinterpretSlice` — `&[T]` → `&[u8]` view (T is u8/u16 in practice).
+use bun_core::slice_as_bytes as reinterpret_to_u8;
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, core::marker::ConstParamTy)]
 pub enum Encoding {
     Ascii,
     Utf8,
@@ -725,10 +721,7 @@ pub fn last_index_of_char(self_: &[u8], char: u8) -> Option<usize> {
     }
 }
 
-#[inline]
-pub fn last_index_of_char_t<T: Eq>(self_: &[T], char: T) -> Option<usize> {
-    self_.iter().rposition(|c| *c == char)
-}
+pub use bun_core::strings::last_index_of_char_t;
 
 #[inline]
 pub fn last_index_of(self_: &[u8], str: &[u8]) -> Option<usize> {
@@ -1015,34 +1008,7 @@ pub trait Appender {
     fn append_lower_case(&mut self, s: &[u8]) -> Result<&[u8], AllocError>;
 }
 
-pub use bun_core::strings::copy_lowercase;
-
-pub fn copy_lowercase_if_needed<'a>(in_: &'a [u8], out: &'a mut [u8]) -> &'a [u8] {
-    let mut in_slice = in_;
-    let mut out_off: usize = 0;
-    let mut any = false;
-
-    'begin: loop {
-        for (i, &c) in in_slice.iter().enumerate() {
-            if let b'A'..=b'Z' = c {
-                out[out_off..out_off + i].copy_from_slice(&in_slice[0..i]);
-                out[out_off + i] = c.to_ascii_lowercase();
-                let end = i + 1;
-                in_slice = &in_slice[end..];
-                out_off += end;
-                any = true;
-                continue 'begin;
-            }
-        }
-
-        if any {
-            out[out_off..out_off + in_slice.len()].copy_from_slice(in_slice);
-        }
-        break;
-    }
-
-    if any { &out[0..in_.len()] } else { in_ }
-}
+pub use bun_core::strings::{copy_lowercase, copy_lowercase_if_needed};
 
 /// Copy a string into a buffer
 /// Return the copied version
@@ -1098,8 +1064,10 @@ pub fn is_utf8_char_boundary(c: u8) -> bool {
     (c as i8) >= -0x40
 }
 
+#[inline]
 pub fn starts_with_case_insensitive_ascii(self_: &[u8], prefix: &[u8]) -> bool {
-    self_.len() >= prefix.len() && eql_case_insensitive_ascii(&self_[0..prefix.len()], prefix, false)
+    if prefix.is_empty() { return true; }
+    self_.len() >= prefix.len() && eql_case_insensitive_ascii(&self_[..prefix.len()], prefix, false)
 }
 
 pub use bun_core::strings::{has_prefix_t as starts_with_generic, has_suffix_t as ends_with_generic};
@@ -1322,14 +1290,11 @@ pub fn eql_case_insensitive_ascii_ignore_length(a: &[u8], b: &[u8]) -> bool {
     eql_case_insensitive_ascii(a, b, false)
 }
 
-pub use bun_core::strings::eql_case_insensitive_ascii_check_length;
+pub use bun_core::strings::{eql_any_case_insensitive_ascii, eql_case_insensitive_ascii_check_length};
 
 /// Preserves Zig's triple-`i` typo (`eqlCaseInsensitiveASCIIICheckLength`); both
 /// spellings are reachable from ported call sites until the next typo sweep.
-#[inline]
-pub fn eql_case_insensitive_asciii_check_length(a: &[u8], b: &[u8]) -> bool {
-    eql_case_insensitive_ascii(a, b, true)
-}
+pub use bun_core::strings::eql_case_insensitive_ascii_check_length as eql_case_insensitive_asciii_check_length;
 
 // PORT NOTE: Zig's `comptime check_len: bool` was first ported as a const
 // generic, but the dominant call shape across the tree passes it as a runtime
@@ -1373,9 +1338,7 @@ pub fn has_prefix_case_insensitive_t<T: bun_core::NoUninit + Into<u32>>(str: &[T
     eql_case_insensitive_t(&str[0..prefix.len()], prefix)
 }
 
-pub fn has_prefix_case_insensitive(str: &[u8], prefix: &[u8]) -> bool {
-    has_prefix_case_insensitive_t(str, prefix)
-}
+pub use self::starts_with_case_insensitive_ascii as has_prefix_case_insensitive;
 
 pub fn eql_long_t<T: bun_core::NoUninit, const CHECK_LEN: bool>(a_str: &[T], b_str: &[T]) -> bool {
     if CHECK_LEN {
@@ -1980,6 +1943,20 @@ pub fn trim_leading_pattern2(slice_: &[u8], byte1: u8, byte2: u8) -> &[u8] {
     slice
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Prefix/suffix stripping — two real bodies per axis, the rest alias.
+//
+//   comptime canonical : trim_prefix_comptime<T> / trim_suffix_comptime
+//                        (`&'static` needle → eql_comptime_check_len_with_type)
+//   runtime  canonical : without_prefix        / trim_suffix
+//                        (borrowed `&[u8]` needle → has_prefix/eql_long or slice ==)
+//
+// `without_*` and `trim_*` spellings are kept as #[inline] forwarders so every
+// call-site ported from Zig (which had the same duplication) keeps compiling.
+// All variants are observationally identical on their overlapping domain,
+// including the empty-needle case.
+// ─────────────────────────────────────────────────────────────────────
+
 /// prefix is of type &[u8] or &[u16]
 pub fn trim_prefix_comptime<'a, T: bun_core::NoUninit + Eq>(buffer: &'a [T], prefix: &'static [T]) -> &'a [T] {
     if has_prefix_comptime_type(buffer, prefix) {
@@ -2001,11 +1978,7 @@ pub fn trim_suffix_comptime<'a>(buffer: &'a [u8], suffix: &'static [u8]) -> &'a 
 /// buffer (`hosted_git_info`, `npm-pack-args` parsers).
 #[inline]
 pub fn trim_prefix<'a>(buffer: &'a [u8], prefix: &[u8]) -> &'a [u8] {
-    if buffer.len() >= prefix.len() && &buffer[..prefix.len()] == prefix {
-        &buffer[prefix.len()..]
-    } else {
-        buffer
-    }
+    without_prefix(buffer, prefix)
 }
 
 #[inline]
@@ -2016,6 +1989,7 @@ pub fn trim_suffix<'a>(buffer: &'a [u8], suffix: &[u8]) -> &'a [u8] {
         buffer
     }
 }
+pub use trim_suffix as without_suffix;
 
 /// Get the line number and the byte offsets of `line_range_count` above the desired line number
 /// The final element is the end index of the desired line
@@ -2143,15 +2117,11 @@ pub fn get_lines_in_text<const LINE_RANGE_COUNT: usize>(
     Some(results)
 }
 
+/// Thin `u32` view over the canonical [`bun_core::strings::first_non_ascii16`]
+/// (Zig spec `firstNonASCII16 -> ?u32`). Mirrors [`first_non_ascii`] above.
+#[inline]
 pub fn first_non_ascii16(slice: &[u16]) -> Option<u32> {
-    // PERF(port): Zig used @Vector(8,u16) max-reduce + @ctz on bitmask. Scalar
-    // loop here; Phase B: portable_simd or simdutf utf16 validator.
-    for (i, &char) in slice.iter().enumerate() {
-        if char > 127 {
-            return Some(u32::try_from(i).unwrap());
-        }
-    }
-    None
+    bun_core::strings::first_non_ascii16(slice).map(|i| i as u32)
 }
 
 // this is std.mem.trim except it doesn't forcibly change the slice to be const
@@ -2383,41 +2353,7 @@ pub const UNICODE_REPLACEMENT: u32 = 0xFFFD;
 // UTF-8 encoding of U+FFFD
 pub const UNICODE_REPLACEMENT_STR: [u8; 3] = [0xEF, 0xBF, 0xBD];
 
-// Spec (immutable.zig:1990, 2003) calls `bun.c_ares.ares_inet_pton`, the vendored
-// c-ares implementation. Do NOT call the system `inet_pton` here: on Windows that
-// resolves into ws2_32.dll and fails with WSANOTINITIALISED whenever it runs before
-// `WSAStartup()`, which URL/host parsing can. c-ares' impl is pure C, no preconditions.
-unsafe extern "C" {
-    pub fn ares_inet_pton(af: c_int, src: *const core::ffi::c_char, dst: *mut core::ffi::c_void) -> c_int;
-}
-// dep-graph: bun_string < bun_sys, so cannot import the canonical
-// `bun_sys::posix::AF`. Keep a thin libc/ws2def passthrough instead. The
-// previous hand-rolled cfg ladder hardcoded `10` for the BSD fallback, which
-// is wrong (FreeBSD AF_INET6 == 28); routing through `libc` fixes that.
-const AF_INET: c_int = 2;
-#[cfg(not(windows))] const AF_INET6: c_int = libc::AF_INET6 as c_int;
-#[cfg(windows)]      const AF_INET6: c_int = 23; // ws2def.h
-
-pub fn is_ip_address(input: &[u8]) -> bool {
-    let mut buf = [0u8; 512];
-    if input.len() >= buf.len() { return false; }
-    buf[..input.len()].copy_from_slice(input);
-    let mut dst = [0u8; 28];
-    // SAFETY: buf is NUL-terminated; dst ≥ sizeof(in6_addr).
-    unsafe {
-        ares_inet_pton(AF_INET, buf.as_ptr().cast(), dst.as_mut_ptr().cast()) > 0
-            || ares_inet_pton(AF_INET6, buf.as_ptr().cast(), dst.as_mut_ptr().cast()) > 0
-    }
-}
-
-pub fn is_ipv6_address(input: &[u8]) -> bool {
-    let mut buf = [0u8; 512];
-    if input.len() >= buf.len() { return false; }
-    buf[..input.len()].copy_from_slice(input);
-    let mut dst = [0u8; 28];
-    // SAFETY: buf is NUL-terminated; dst ≥ sizeof(in6_addr).
-    unsafe { ares_inet_pton(AF_INET6, buf.as_ptr().cast(), dst.as_mut_ptr().cast()) > 0 }
-}
+pub use bun_core::strings::{ares_inet_pton, is_ip_address, is_ipv6_address};
 
 pub fn left_has_any_in_right(to_check: &[&[u8]], against: &[&[u8]]) -> bool {
     for check in to_check {
@@ -2462,23 +2398,9 @@ pub fn has_prefix_with_word_boundary(input: &[u8], prefix: &'static [u8]) -> boo
     false
 }
 
-pub fn concat_with_length(args: &[&[u8]], length: usize) -> Box<[u8]> {
-    let mut out = vec![0u8; length].into_boxed_slice();
-    let mut off: usize = 0;
-    for arg in args {
-        out[off..off + arg.len()].copy_from_slice(arg);
-        off += arg.len();
-    }
-    debug_assert!(off == length); // all bytes should be used
-    out
-}
-
+#[inline]
 pub fn concat(args: &[&[u8]]) -> Box<[u8]> {
-    let mut length: usize = 0;
-    for arg in args {
-        length += arg.len();
-    }
-    concat_with_length(args, length)
+    bun_core::concat_boxed(args)
 }
 
 pub fn concat_if_needed(
@@ -2542,7 +2464,7 @@ pub fn concat_if_needed(
         return Ok(());
     }
 
-    *dest = concat_with_length(args, total_length);
+    *dest = concat(args);
     Ok(())
 }
 
@@ -2596,7 +2518,7 @@ impl core::fmt::Display for QuoteEscapeFormat<'_> {
         // a Vec so `write_pre_quoted_string`'s `PrinterWriter` bound is met
         // without an adapter for `core::fmt::Formatter`. Profile in Phase B.
         let mut buf: Vec<u8> = Vec::with_capacity(self.data.len() + 8);
-        crate::printer::write_pre_quoted_string(
+        crate::printer::write_pre_quoted_string_rt(
             self.data,
             &mut buf,
             self.flags.quote_char,
@@ -2628,18 +2550,14 @@ pub fn contains_scalar<T: bun_core::NoUninit + Eq>(input: &[T], item: T) -> bool
     index_of_scalar(input, item).is_some()
 }
 
+#[inline]
 pub fn without_suffix_comptime<'a>(input: &'a [u8], suffix: &'static [u8]) -> &'a [u8] {
-    if has_suffix_comptime(input, suffix) {
-        return &input[0..input.len() - suffix.len()];
-    }
-    input
+    trim_suffix_comptime(input, suffix)
 }
 
+#[inline]
 pub fn without_prefix_comptime<'a>(input: &'a [u8], prefix: &'static [u8]) -> &'a [u8] {
-    if has_prefix_comptime(input, prefix) {
-        return &input[prefix.len()..];
-    }
-    input
+    trim_prefix_comptime::<u8>(input, prefix)
 }
 
 pub fn without_prefix_comptime_z<'a>(input: &'a crate::ZStr, prefix: &'static [u8]) -> &'a crate::ZStr {
@@ -2718,7 +2636,7 @@ pub fn percent_encode_write(
 
         // URL encode the code point
         for &byte in to_encode {
-            let h = bun_core::fmt::hex2_lower(byte);
+            let h = bun_core::fmt::hex_byte_lower(byte);
             writer.extend_from_slice(&[b'%', h[0], h[1]]);
         }
     }

@@ -151,32 +151,9 @@ impl WTFStringImplExt for WTFStringImplStruct {
 // WTFStringImpl when freed. Replaced by `ZigStringSlice::WTF { .. }` explicit
 // ownership variant — see `to_latin1_slice` above. No allocator trait needed.
 
-// ──────────────────────────────────────────────────────────────────────────
-// move-in: parse_double (MOVE_DOWN ← src/jsc/WTF.zig `WTF.parseDouble`)
-//
-// Thin wrapper around WebKit's WTF__parseDouble. Lives here so
-// `bun_interchange` (yaml) and `bun_js_parser::lexer` can call it without
-// depending on `bun_jsc`.
-// ──────────────================================================────────────
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct InvalidCharacter;
-
-pub fn parse_double(buf: &[u8]) -> Result<f64, InvalidCharacter> {
-    if buf.is_empty() {
-        return Err(InvalidCharacter);
-    }
-    let mut count: usize = 0;
-    // SAFETY: buf is a valid slice; WTF__parseDouble reads at most `length` bytes.
-    let res = unsafe { WTF__parseDouble(buf.as_ptr(), buf.len(), &raw mut count) };
-    if count == 0 {
-        return Err(InvalidCharacter);
-    }
-    Ok(res)
-}
-
-unsafe extern "C" {
-    fn WTF__parseDouble(bytes: *const u8, length: usize, counted: *mut usize) -> f64;
-}
+// `WTF.parseDouble` canonical now lives in bun_core::fmt (tier-0) so
+// `bun_interchange` (yaml/toml) and `bun_js_parser::lexer` can call it without
+// any string/jsc dep. Re-exported here to keep the Zig namespace shape.
+pub use bun_core::fmt::{parse_double, InvalidCharacter};
 
 // ported from: src/string/wtf.zig

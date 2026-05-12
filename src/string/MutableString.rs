@@ -201,7 +201,7 @@ impl MutableString {
 
         if !needs_gap {
             let remapped =
-                js_lexer_tables::strict_mode_reserved_words_remap(str).unwrap_or(str);
+                js_lexer_tables::strict_mode_reserved_word_remap(str).unwrap_or(str);
             return Ok(Box::<[u8]>::from(remapped));
         }
 
@@ -260,8 +260,7 @@ impl MutableString {
 
     pub fn copy(&mut self, str: impl AsRef<[u8]>) -> Result<(), AllocError> {
         let str = str.as_ref();
-        self.list
-            .reserve(str.len().saturating_sub(self.list.len()));
+        self.list.ensure_total_capacity(str.len());
 
         if self.list.is_empty() {
             // Zig: list.insertSlice(allocator, 0, str)
@@ -321,7 +320,7 @@ impl MutableString {
         // Zig MutableString.inflate: `list.resize(amount)` leaves new bytes
         // uninitialized. Match that — callers always overwrite the inflated
         // region (it's a printer buffer pre-size).
-        self.list.reserve(amount.saturating_sub(self.list.len()));
+        self.list.ensure_total_capacity(amount);
         // SAFETY: `u8` has no drop and any bit pattern is valid; capacity ≥
         // `amount` after `reserve`. Callers MUST write before reading.
         unsafe { self.list.set_len(amount) };
@@ -370,8 +369,8 @@ impl bun_core::io::Write for MutableString {
 impl MutableString {
     #[inline]
     pub fn append_int(&mut self, int: u64) -> Result<(), AllocError> {
-        let mut b = [0u8; 20];
-        self.list.extend_from_slice(bun_core::fmt::int_as_bytes(&mut b, int));
+        let mut b = bun_core::fmt::ItoaBuf::new();
+        self.list.extend_from_slice(bun_core::fmt::itoa(&mut b, int));
         Ok(())
     }
 
