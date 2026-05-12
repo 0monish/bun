@@ -30,11 +30,10 @@ use bun_options_types::bundle_enums as bundle_opts;
 use bun_core::Output;
 use bun_sys::Fd;
 
-/// Local stand-in for `bun_str::strings::Encoding` that derives `ConstParamTy` so it can
-/// be used as a const-generic parameter (`const ENCODING: Encoding`). The variant set is
-/// identical; convert at the boundary if a `strings::Encoding` is ever needed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, core::marker::ConstParamTy)]
-pub enum Encoding { Ascii, Utf8, Latin1, Utf16 }
+/// `bun_str::strings::Encoding` now derives `ConstParamTy` directly, so the
+/// former local stand-in enum is gone — re-export the canonical type for
+/// downstream `bun_js_printer::Encoding` callers.
+pub use bun_str::printer::Encoding;
 
 /// Byte-sink trait used by the string-escape helpers and `StdWriterAdapter`.
 /// Re-exported from `bun_io` (canonical in `bun_core::io`); any `bun_io::Write`
@@ -627,50 +626,24 @@ pub mod analyze_transpiled_module {
 /// link-interface); the printer just holds the raw pointer.
 pub type RuntimeTranspilerCacheRef = core::ptr::NonNull<bun_ast::RuntimeTranspilerCache>;
 
-use bun_core::fmt::hex2_upper; // remaining `\xHH` site below
-use bun_str::printer::{
-    FIRST_ASCII, LAST_ASCII, FIRST_HIGH_SURROGATE, LAST_LOW_SURROGATE, bmp_escape,
-    surrogate_pair_escape,
+// String-quoting helpers are canonical in `bun_str::printer`; re-export the
+// full surface so downstream `bun_js_printer::*` paths keep working.
+pub use bun_str::printer::{
+    bmp_escape, can_print_without_escape, estimate_length_for_utf8, quote_for_json,
+    surrogate_pair_escape, write_json_string, write_pre_quoted_string,
+    write_pre_quoted_string_rt, FIRST_ASCII, FIRST_HIGH_SURROGATE, FIRST_LOW_SURROGATE,
+    LAST_ASCII, LAST_LOW_SURROGATE,
 };
 
 /// For support JavaScriptCore
 const ASCII_ONLY_ALWAYS_ON_UNLESS_MINIFYING: bool = true;
 
-fn format_unsigned_integer_between<const LEN: usize>(buf: &mut [u8; LEN], val: u64) {
-    let mut remainder = val;
-    // Write out the number from the end to the front
-    let mut i = LEN;
-    while i > 0 {
-        i -= 1;
-        buf[i] = u8::try_from(remainder % 10).expect("int cast") + b'0';
-        remainder /= 10;
-    }
-    // PERF(port): was comptime `inline while` unrolling — profile
-}
+use bun_core::fmt::itoa_padded;
 
 pub fn write_module_id(writer: &mut impl core::fmt::Write, module_id: u32) {
     debug_assert!(module_id != 0); // either module_id is forgotten or it should be disabled
     writer.write_str("$").expect("unreachable");
     write!(writer, "{:x}", module_id).expect("unreachable");
-}
-
-// PERF(port): was comptime monomorphization (`comptime CodePointType: type`) — Zig
-// instantiated per code-unit type; Rust callers widen to i32 at the boundary. Profile.
-pub fn can_print_without_escape<const ASCII_ONLY: bool>(c: i32) -> bool {
-    if c <= LAST_ASCII as i32 {
-        c >= FIRST_ASCII as i32
-            && c != i32::from(b'\\')
-            && c != i32::from(b'"')
-            && c != i32::from(b'\'')
-            && c != i32::from(b'`')
-            && c != i32::from(b'$')
-    } else {
-        !ASCII_ONLY
-            && c != 0xFEFF
-            && c != 0x2028
-            && c != 0x2029
-            && (c < FIRST_HIGH_SURROGATE as i32 || c > LAST_LOW_SURROGATE as i32)
-    }
 }
 
 const INDENTATION_SPACE_BUF: [u8; 128] = [b' '; 128];
@@ -768,216 +741,6 @@ macro_rules! ws {
     }};
 }
 
-pub fn estimate_length_for_utf8<const ASCII_ONLY: bool, const QUOTE_CHAR: u8>(input: &[u8]) -> usize {
-    let mut remaining = input;
-    let mut len: usize = 2; // for quotes
-
-    while let Some(i) = strings::index_of_needs_escape_for_java_script_string(remaining, QUOTE_CHAR) {
-        let i = i as usize;
-        len += i;
-        remaining = &remaining[i..];
-        let char_len = strings::wtf8_byte_sequence_length_with_invalid(remaining[0]);
-        let bytes: [u8; 4] = match char_len {
-            // 0 is not returned by `wtf8_byte_sequence_length_with_invalid`
-            1 => [remaining[0], 0, 0, 0],
-            2 => [remaining[0], remaining[1], 0, 0],
-            3 => [remaining[0], remaining[1], remaining[2], 0],
-            4 => [remaining[0], remaining[1], remaining[2], remaining[3]],
-            _ => unreachable!(),
-        };
-        let c = strings::decode_wtf8_rune_t::<i32>(&bytes, char_len, 0);
-        if can_print_without_escape::<ASCII_ONLY>(c) {
-            len += char_len as usize;
-        } else if c <= 0xFFFF {
-            len += 6;
-        } else {
-            len += 12;
-        }
-        remaining = &remaining[char_len as usize..];
-    }
-    // Zig's `else` on `while` runs when the condition fails (i.e. `None`).
-    if remaining.as_ptr() == input.as_ptr() {
-        // PORT NOTE: reshaped — Zig returns `remaining.len + 2` when *no* escape was ever found.
-        // The branch above already handled the loop body; falling out of the loop with no
-        // iterations means "no escapes anywhere".
-    }
-    // TODO(port): the original `while ... else { return remaining.len + 2 }` returns early when
-    // index_of_needs_escape returns null at the *first* check. The current shape returns `len`
-    // (which equals 2) plus nothing for `remaining`. Match Zig precisely.
-    len + remaining.len()
-}
-
-pub fn write_pre_quoted_string<W, const QUOTE_CHAR: u8, const ASCII_ONLY: bool, const JSON: bool, const ENCODING: Encoding>(
-    text_in: &[u8],
-    writer: &mut W,
-) -> Result<(), bun_core::Error>
-where
-    W: Write + ?Sized,
-{
-    // TODO(port): for ENCODING == Utf16, Zig reinterprets `text_in` as []const u16 via bytesAsSlice.
-    // In Rust we keep `text_in: &[u8]` and index by code-unit width below.
-    debug_assert!(!(JSON && QUOTE_CHAR != b'"'), "for json, quote_char must be '\"'");
-
-    // PORT NOTE: this is a large hot-path function; logic is ported 1:1 but the
-    // utf16 path needs &[u16] handling.
-    let text = text_in;
-    let mut i: usize = 0;
-    let n: usize = match ENCODING {
-        Encoding::Utf16 => text.len() / 2,
-        _ => text.len(),
-    };
-
-    macro_rules! code_unit_at {
-        ($idx:expr) => {
-            match ENCODING {
-                Encoding::Utf16 => {
-                    let lo = text[$idx * 2];
-                    let hi = text[$idx * 2 + 1];
-                    u16::from_le_bytes([lo, hi]) as i32
-                }
-                _ => text[$idx] as i32,
-            }
-        };
-    }
-
-    while i < n {
-        let width: u8 = match ENCODING {
-            Encoding::Latin1 | Encoding::Ascii => 1,
-            Encoding::Utf8 => strings::wtf8_byte_sequence_length_with_invalid(text[i]),
-            Encoding::Utf16 => 1,
-        };
-        let clamped_width = (width as usize).min(n.saturating_sub(i));
-        let c: i32 = match ENCODING {
-            Encoding::Utf8 => {
-                let bytes: [u8; 4] = match clamped_width {
-                    1 => [text[i], 0, 0, 0],
-                    2 => [text[i], text[i + 1], 0, 0],
-                    3 => [text[i], text[i + 1], text[i + 2], 0],
-                    4 => [text[i], text[i + 1], text[i + 2], text[i + 3]],
-                    _ => unreachable!(),
-                };
-                strings::decode_wtf8_rune_t::<i32>(&bytes, width, 0)
-            }
-            Encoding::Ascii => {
-                debug_assert!(text[i] <= 0x7F);
-                text[i] as i32
-            }
-            Encoding::Latin1 => text[i] as i32,
-            Encoding::Utf16 => {
-                // TODO: if this is a part of a surrogate pair, we could parse the whole codepoint in order
-                // to emit it as a single \u{result} rather than two paired \uLOW\uHIGH.
-                // eg: "\u{10334}" will convert to "𐌴" without this.
-                code_unit_at!(i)
-            }
-        };
-
-        if can_print_without_escape::<ASCII_ONLY>(c) {
-            match ENCODING {
-                Encoding::Ascii | Encoding::Utf8 => {
-                    let remain = &text[i + clamped_width..];
-                    if let Some(j) = strings::index_of_needs_escape_for_java_script_string(remain, QUOTE_CHAR) {
-                        let j = j as usize;
-                        let text_chunk = &text[i..i + clamped_width];
-                        writer.write_all(text_chunk)?;
-                        i += clamped_width;
-                        writer.write_all(&remain[..j])?;
-                        i += j;
-                    } else {
-                        writer.write_all(&text[i..])?;
-                        i = n;
-                        break;
-                    }
-                }
-                Encoding::Latin1 | Encoding::Utf16 => {
-                    let mut codepoint_bytes = [0u8; 4];
-                    let codepoint_len = strings::encode_wtf8_rune(&mut codepoint_bytes, c as u32);
-                    writer.write_all(&codepoint_bytes[..codepoint_len])?;
-                    i += clamped_width;
-                }
-            }
-            continue;
-        }
-        match c {
-            0x07 => { writer.write_all(b"\\x07")?; i += 1; }
-            0x08 => { writer.write_all(b"\\b")?; i += 1; }
-            0x0C => { writer.write_all(b"\\f")?; i += 1; }
-            0x0A => {
-                if QUOTE_CHAR == b'`' { writer.write_all(b"\n")?; } else { writer.write_all(b"\\n")?; }
-                i += 1;
-            }
-            0x0D => { writer.write_all(b"\\r")?; i += 1; }
-            // \v
-            0x0B => { writer.write_all(b"\\v")?; i += 1; }
-            // "\\"
-            0x5C => { writer.write_all(b"\\\\")?; i += 1; }
-            0x22 => {
-                if QUOTE_CHAR == b'"' { writer.write_all(b"\\\"")?; } else { writer.write_all(b"\"")?; }
-                i += 1;
-            }
-            0x27 => {
-                if QUOTE_CHAR == b'\'' { writer.write_all(b"\\'")?; } else { writer.write_all(b"'")?; }
-                i += 1;
-            }
-            0x60 => {
-                if QUOTE_CHAR == b'`' { writer.write_all(b"\\`")?; } else { writer.write_all(b"`")?; }
-                i += 1;
-            }
-            0x24 => {
-                if QUOTE_CHAR == b'`' {
-                    let next = if i + clamped_width < n { Some(code_unit_at!(i + clamped_width)) } else { None };
-                    if next == Some(b'{' as i32) {
-                        writer.write_all(b"\\$")?;
-                    } else {
-                        writer.write_all(b"$")?;
-                    }
-                } else {
-                    writer.write_all(b"$")?;
-                }
-                i += 1;
-            }
-            0x09 => {
-                if QUOTE_CHAR == b'`' { writer.write_all(b"\t")?; } else { writer.write_all(b"\\t")?; }
-                i += 1;
-            }
-            _ => {
-                i += width as usize;
-
-                if c <= 0xFF && !JSON {
-                    let h = hex2_upper(c as u8);
-                    writer.write_all(&[b'\\', b'x', h[0], h[1]])?;
-                } else if c <= 0xFFFF {
-                    writer.write_all(&bmp_escape(c as u32))?;
-                } else {
-                    writer.write_all(&surrogate_pair_escape(c as u32))?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn quote_for_json(text: &[u8], bytes: &mut MutableString, ascii_only: bool) -> Result<(), bun_core::Error> {
-    // Zig: `comptime ascii_only: bool`. Downstream callers (bundler) pass a literal
-    // at each site, so dispatch to the const-generic helpers here.
-    if ascii_only {
-        bytes.grow_if_needed(estimate_length_for_utf8::<true, b'"'>(text))?;
-        bytes.append_char(b'"')?;
-        write_pre_quoted_string::<_, b'"', true, true, { Encoding::Utf8 }>(text, bytes)?;
-    } else {
-        bytes.grow_if_needed(estimate_length_for_utf8::<false, b'"'>(text))?;
-        bytes.append_char(b'"')?;
-        write_pre_quoted_string::<_, b'"', false, true, { Encoding::Utf8 }>(text, bytes)?;
-    }
-    bytes.append_char(b'"').expect("unreachable");
-    Ok(())
-}
-
-pub fn write_json_string<W: Write + ?Sized, const ENCODING: Encoding>(input: &[u8], writer: &mut W) -> Result<(), bun_core::Error> {
-    writer.write_all(b"\"")?;
-    write_pre_quoted_string::<_, b'"', false, true, ENCODING>(input, writer)?;
-    writer.write_all(b"\"")?;
-    Ok(())
-}
 
 // ───────────────────────────────────────────────────────────────────────────
 // SourceMapHandler / Options — gated on bun_sourcemap::Chunk::Builder and the
@@ -1414,28 +1177,6 @@ pub(crate) fn set_flag<T: enumset::EnumSetType>(set: &mut enumset::EnumSet<T>, f
 }
 
 // ── local string helpers not yet exported by `bun_string::strings` ────────
-// TODO(b2-blocked): bun_string::strings::contains_non_bmp_code_point_or_is_invalid_identifier
-#[inline]
-pub(crate) fn contains_non_bmp_code_point_or_is_invalid_identifier(alias: &[u8]) -> bool {
-    // Mirrors src/string/immutable/unicode.zig:containsNonBmpCodePointOrIsInvalidIdentifier.
-    // NB: `is_identifier` *accepts* non-BMP ID chars; the Zig deliberately also flags any
-    // c > 0xFFFF (even valid identifier chars) so the printer quotes such aliases.
-    let iter = CodepointIterator::init(alias);
-    let mut curs = strings::Cursor::default();
-
-    if !iter.next(&mut curs) {
-        return true;
-    }
-    if curs.c > 0xFFFF || !lexer::is_identifier_start(curs.c) {
-        return true;
-    }
-    while iter.next(&mut curs) {
-        if curs.c > 0xFFFF || !lexer::is_identifier_continue(curs.c) {
-            return true;
-        }
-    }
-    false
-}
 // TODO(b2-blocked): bun_string::strings::encode_wtf8_rune_t (generic CodeUnit variant)
 #[inline]
 pub(crate) fn encode_wtf8_rune_t(tmp: &mut [u8; 4], c: u32) -> usize {
@@ -2187,7 +1928,7 @@ where
     pub fn print_clause_alias(&mut self, alias: &[u8]) {
         debug_assert!(!alias.is_empty());
 
-        if !contains_non_bmp_code_point_or_is_invalid_identifier(alias) {
+        if !strings::contains_non_bmp_code_point_or_is_invalid_identifier(alias) {
             self.print_space_before_identifier();
             self.print_identifier(alias);
         } else {
@@ -2321,59 +2062,23 @@ where
                     self.print(&bytes[..]);
                 }
                 10 => self.print(b"10"),
-                11..=99 => {
-                    let mut tmp = [0u8; 2];
-                    format_unsigned_integer_between::<2>(&mut tmp, val);
-                    self.print_reserved_n(&tmp);
-                }
+                11..=99 => self.print_reserved_n(&itoa_padded::<2>(val)),
                 100 => self.print(b"100"),
-                101..=999 => {
-                    let mut tmp = [0u8; 3];
-                    format_unsigned_integer_between::<3>(&mut tmp, val);
-                    self.print_reserved_n(&tmp);
-                }
+                101..=999 => self.print_reserved_n(&itoa_padded::<3>(val)),
                 1000 => self.print(b"1000"),
-                1001..=9999 => {
-                    let mut tmp = [0u8; 4];
-                    format_unsigned_integer_between::<4>(&mut tmp, val);
-                    self.print_reserved_n(&tmp);
-                }
+                1001..=9999 => self.print_reserved_n(&itoa_padded::<4>(val)),
                 10000 => self.print(b"1e4"),
                 100000 => self.print(b"1e5"),
                 1000000 => self.print(b"1e6"),
                 10000000 => self.print(b"1e7"),
                 100000000 => self.print(b"1e8"),
                 1000000000 => self.print(b"1e9"),
-                10001..=99999 => {
-                    let mut tmp = [0u8; 5];
-                    format_unsigned_integer_between::<5>(&mut tmp, val);
-                    self.print_reserved_n(&tmp);
-                }
-                100001..=999999 => {
-                    let mut tmp = [0u8; 6];
-                    format_unsigned_integer_between::<6>(&mut tmp, val);
-                    self.print_reserved_n(&tmp);
-                }
-                1_000_001..=9_999_999 => {
-                    let mut tmp = [0u8; 7];
-                    format_unsigned_integer_between::<7>(&mut tmp, val);
-                    self.print_reserved_n(&tmp);
-                }
-                10_000_001..=99_999_999 => {
-                    let mut tmp = [0u8; 8];
-                    format_unsigned_integer_between::<8>(&mut tmp, val);
-                    self.print_reserved_n(&tmp);
-                }
-                100_000_001..=999_999_999 => {
-                    let mut tmp = [0u8; 9];
-                    format_unsigned_integer_between::<9>(&mut tmp, val);
-                    self.print_reserved_n(&tmp);
-                }
-                1_000_000_001..=9_999_999_999 => {
-                    let mut tmp = [0u8; 10];
-                    format_unsigned_integer_between::<10>(&mut tmp, val);
-                    self.print_reserved_n(&tmp);
-                }
+                10001..=99999 => self.print_reserved_n(&itoa_padded::<5>(val)),
+                100001..=999999 => self.print_reserved_n(&itoa_padded::<6>(val)),
+                1_000_001..=9_999_999 => self.print_reserved_n(&itoa_padded::<7>(val)),
+                10_000_001..=99_999_999 => self.print_reserved_n(&itoa_padded::<8>(val)),
+                100_000_001..=999_999_999 => self.print_reserved_n(&itoa_padded::<9>(val)),
+                1_000_000_001..=9_999_999_999 => self.print_reserved_n(&itoa_padded::<10>(val)),
                 _ => { let _ = self.fmt(format_args!("{}", val)); }
             }
             return;
@@ -6536,11 +6241,8 @@ impl BufferWriter {
 
     pub fn advance_by(&mut self, count: u64) {
         let count_usize = usize::try_from(count).expect("int cast");
-        if cfg!(debug_assertions) {
-            debug_assert!(self.buffer.list.len() + count_usize <= self.buffer.list.capacity());
-        }
         // SAFETY: reserve_next was called and the bytes were initialized
-        unsafe { self.buffer.list.set_len(self.buffer.list.len() + count_usize); }
+        unsafe { bun_core::vec::commit_spare(&mut self.buffer.list, count_usize); }
 
         let len = self.buffer.list.len();
         if count >= 2 {

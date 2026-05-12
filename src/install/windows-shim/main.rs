@@ -240,6 +240,13 @@ pub mod bun_core {
 
     /// Mirrors the subset of `bun_core::ffi` the shim calls.
     pub mod ffi {
+        // `core`-only slice/wstr primitives — single audited copy lives in
+        // `bun_opaque::ffi` (zero-dep, zero `#[no_mangle]`, safe for this
+        // freestanding PE to depend on). `Zeroable`/`zeroed` stay local: the
+        // orphan rule blocks `bun_opaque` from `impl Zeroable for
+        // bun_windows_sys::*`, and `bun_core`'s impls drag in link roots.
+        pub use bun_opaque::ffi::{slice, slice_mut, wcslen, wstr_units};
+
         /// Marker: all-zero bit pattern is a valid `Self`. Local re-spelling
         /// of `bun_core::ffi::Zeroable`; impl'd below for the two
         /// `bun_windows_sys` POD types the shim zero-inits.
@@ -257,62 +264,6 @@ pub mod bun_core {
         pub const fn zeroed<T: Zeroable>() -> T {
             // SAFETY: `T: Zeroable` asserts all-zero is valid for `T`.
             unsafe { core::mem::zeroed() }
-        }
-
-        /// Mirrors `bun_core::ffi::slice` — tolerates `(null, 0)`.
-        ///
-        /// # Safety
-        /// `from_raw_parts` contract when `len > 0`; null only at `len == 0`.
-        #[inline(always)]
-        pub const unsafe fn slice<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
-            if ptr.is_null() {
-                assert!(len == 0, "ffi::slice: null ptr with non-zero len");
-                &[]
-            } else {
-                // SAFETY: caller contract.
-                unsafe { core::slice::from_raw_parts(ptr, len) }
-            }
-        }
-
-        /// Mirrors `bun_core::ffi::slice_mut`.
-        ///
-        /// # Safety
-        /// As [`slice`], plus exclusive access for `'a`.
-        #[inline(always)]
-        pub const unsafe fn slice_mut<'a, T>(ptr: *mut T, len: usize) -> &'a mut [T] {
-            if ptr.is_null() {
-                assert!(len == 0, "ffi::slice_mut: null ptr with non-zero len");
-                // Empty mut slice literal: `'static`, no backing needed — no unsafe required.
-                &mut []
-            } else {
-                // SAFETY: caller contract.
-                unsafe { core::slice::from_raw_parts_mut(ptr, len) }
-            }
-        }
-
-        /// Mirrors `bun_core::ffi::wcslen`.
-        ///
-        /// # Safety
-        /// `p` is non-null and NUL-terminated.
-        #[inline(always)]
-        pub unsafe fn wcslen(p: *const u16) -> usize {
-            debug_assert!(!p.is_null(), "ffi::wcslen: null pointer");
-            let mut n = 0usize;
-            // SAFETY: caller contract — non-null, NUL-terminated.
-            while unsafe { *p.add(n) } != 0 {
-                n += 1;
-            }
-            n
-        }
-
-        /// Mirrors `bun_core::ffi::wstr_units`.
-        ///
-        /// # Safety
-        /// As [`wcslen`]; borrow must not outlive `p`'s allocation.
-        #[inline(always)]
-        pub unsafe fn wstr_units<'a>(p: *const u16) -> &'a [u16] {
-            // SAFETY: forwarded to `wcslen`.
-            unsafe { core::slice::from_raw_parts(p, wcslen(p)) }
         }
     }
 }

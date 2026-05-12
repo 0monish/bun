@@ -162,7 +162,7 @@ pub(crate) type DirnameStoreBacking =
 pub(crate) type FilenameStoreBacking =
     allocators::BSSStringList<{ preallocate::counts::FILES * 2 }, { 64 + 1 }>;
 // PORT NOTE: Zig `BSSList(_COUNT)` → Rust `BSSList<{_COUNT * 2}>`.
-pub(crate) type EntryStoreBacking =
+pub type EntryStoreBacking =
     allocators::BSSList<Entry, { preallocate::counts::FILES * 2 }>;
 
 // Per-monomorphization singleton storage — Zig kept `var instance` inside the
@@ -256,12 +256,12 @@ string_store_impl!(FilenameStore, FILENAME_STORE_ZST, filename_store_backing, Fi
 /// @material-ui/icons-style 11,000-entry directories that's 11,000+ redundant
 /// `Once` atomic checks per directory. Resolving once up front and carrying the
 /// raw pointer across the loop drops that to a single check per `readdir`.
-pub(crate) struct FilenameStoreAppender {
+pub struct FilenameStoreAppender {
     backing: *mut FilenameStoreBacking,
 }
 impl FilenameStoreAppender {
     #[inline]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         // One `Once` check, hoisted out of the per-entry loop.
         Self { backing: filename_store_backing() }
     }
@@ -470,23 +470,278 @@ impl FileSystem {
 // PORT NOTE: Zig `FileSystem.deinit()` only called .deinit() on dirname_store/filename_store,
 // which are &'static singletons here — nothing owned to free, so no `impl Drop`.
 
-pub(crate) mod dir_entry {
-    use super::*;
+// ══════════════════════════════════════════════════════════════════════════
+// CANONICAL Entry / DirEntry / EntryLookup family.
+//
+// This is the SINGLE definition. The inline `pub mod fs { … }` block in
+// `lib.rs` re-exports these via `pub use crate::fs_full::{…}` and deletes its
+// own copies (and its second `bss_list!{entry_store_backing}` singleton).
+//
+// `Entry::kind`/`symlink` are decoupled from a concrete `RealFS` type via the
+// `EntryKindResolver` trait so this block does NOT depend on which of the two
+// `RealFS` copies is in scope; both impl the trait by forwarding to their own
+// `RealFS::kind`. Once the (separate) `RealFS`/`Implementation` dedup lands,
+// the trait collapses to a single impl.
+// ══════════════════════════════════════════════════════════════════════════
 
-    pub(crate) type EntryMap = bun_collections::StringHashMap<*mut Entry>;
+/// Decouples `Entry::kind`/`symlink` (the lazy-stat path) from a concrete
+/// `RealFS` type. Both the `fs_full::RealFS` here and the inline-`fs::RealFS`
+/// in `lib.rs` impl this by forwarding to their own `RealFS::kind`.
+pub trait EntryKindResolver {
+    fn resolve_kind(
+        &mut self,
+        dir: &[u8],
+        base: &[u8],
+        existing_fd: Fd,
+        store_fd: bool,
+    ) -> core::result::Result<EntryCache, bun_core::Error>;
+}
+
+/// Port of `FileSystem.Entry.Kind` in `fs.zig`.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EntryKind {
+    Dir,
+    File,
+}
+
+/// Port of `FileSystem.Entry.Cache` in `fs.zig`.
+#[derive(Clone, Copy)]
+pub struct EntryCache {
+    pub symlink: PathString,
+    /// Too much code expects this to be 0
+    /// don't make it bun.invalid_fd
+    pub fd: Fd,
+    pub kind: EntryKind,
+}
+
+impl Default for EntryCache {
+    fn default() -> Self {
+        Self { symlink: PathString::EMPTY, fd: Fd::INVALID, kind: EntryKind::File }
+    }
+}
+
+/// Port of `FileSystem.Entry` in `fs.zig`.
+// PORT NOTE: `cache` / `need_stat` are lazily populated by `Entry::kind` /
+// `Entry::symlink` while callers hold a shared `&Entry` (Zig used a freely-
+// aliasing-mutable `*Entry`). `EntryCache` is `Copy`, so `Cell` gives us safe
+// `.get()/.set()` through `&self` — `RealFS.entries_mutex` serializes access
+// across threads (the `unsafe impl Sync for Entry` below opts back in under
+// that external-locking discipline).
+pub struct Entry {
+    pub cache: core::cell::Cell<EntryCache>,
+    // TODO(port): rule deviation — Zig deinit calls allocator.free(e.dir) so guide says Box<[u8]>,
+    // but this points into DirnameStore (a &'static BSSList). Keeping &'static; Phase B revisit.
+    pub dir: &'static [u8],
+
+    pub base_: strings::StringOrTinyString,
+
+    // Necessary because the hash table uses it as a key
+    pub base_lowercase_: strings::StringOrTinyString,
+
+    pub mutex: Mutex,
+    pub need_stat: core::cell::Cell<bool>,
+
+    pub abs_path: PathString,
+}
+
+impl Entry {
+    /// Snapshot of the lazily-populated stat cache. `EntryCache` is `Copy`
+    /// (3 word-sized fields), so by-value return is free and avoids the
+    /// `&self → &interior` aliasing hazard the old `UnsafeCell` accessor had.
+    #[inline(always)]
+    pub fn cache(&self) -> EntryCache {
+        self.cache.get()
+    }
+
+    /// Overwrite the whole cache (interior mutability via `Cell`).
+    #[inline(always)]
+    pub fn set_cache(&self, c: EntryCache) {
+        self.cache.set(c);
+    }
+
+    /// Update a single cache field. Read-modify-write is fine: callers hold
+    /// `RealFS.entries_mutex` so no torn writes; `EntryCache` is `Copy`.
+    #[inline(always)]
+    pub fn set_cache_fd(&self, fd: Fd) {
+        let mut c = self.cache.get();
+        c.fd = fd;
+        self.cache.set(c);
+    }
+
+    #[inline(always)]
+    pub fn set_cache_kind(&self, kind: EntryKind) {
+        let mut c = self.cache.get();
+        c.kind = kind;
+        self.cache.set(c);
+    }
+
+    #[inline(always)]
+    pub fn set_cache_symlink(&self, symlink: PathString) {
+        let mut c = self.cache.get();
+        c.symlink = symlink;
+        self.cache.set(c);
+    }
+
+    #[inline]
+    pub fn base(&self) -> &[u8] {
+        self.base_.slice()
+    }
+
+    #[inline]
+    pub fn base_lowercase(&self) -> &[u8] {
+        self.base_lowercase_.slice()
+    }
+
+    /// Zig: `entry.dir` field (fs.zig:333) — interned in DirnameStore.
+    #[inline] pub fn dir(&self) -> &'static [u8] { self.dir }
+
+    /// Zig: `entry.abs_path` field. `PathString` is `Copy`.
+    #[inline] pub fn abs_path(&self) -> PathString { self.abs_path }
+
+    /// Zig: `entry.abs_path = PathString.init(...)`.
+    #[inline] pub fn set_abs_path(&mut self, p: PathString) { self.abs_path = p; }
+
+    /// Port of `Entry.kind` in `fs.zig` — stat-on-first-use.
+    // PORT NOTE: `Entry` lives in the EntryStore BSSMap singleton; all access is
+    // serialized through `RealFS.entries_mutex`. Zig used `*Entry` (freely
+    // aliasing-mutable) and `*Fs.FileSystem.RealFS` (raw). `fs` is `*mut` so the
+    // call site does not require a second exclusive `&mut RealFS` borrow while a
+    // `&mut Entry` (borrowed out of `RealFS.entries`) is live. Mutation of the
+    // lazily-populated `need_stat` / `cache` goes through `Cell`. Generic over
+    // `R: EntryKindResolver` so this block is independent of which `RealFS`
+    // copy `fs` points at (see file-top comment).
+    pub fn kind<R: EntryKindResolver>(&self, fs: *mut R, store_fd: bool) -> EntryKind {
+        if self.need_stat.get() {
+            self.need_stat.set(false);
+            // This is technically incorrect, but we are choosing not to handle errors here
+            // SAFETY: `fs` points at the process-global RealFS singleton; caller holds
+            // `entries_mutex` so the `&mut` is exclusive for the duration of this call.
+            match unsafe { &mut *fs }.resolve_kind(self.dir, self.base(), self.cache().fd, store_fd) {
+                Ok(c) => self.cache.set(c),
+                Err(_) => return self.cache().kind,
+            }
+        }
+        self.cache().kind
+    }
+
+    /// Port of `Entry.symlink` in `fs.zig`.
+    pub fn symlink<R: EntryKindResolver>(&self, fs: *mut R, store_fd: bool) -> &'static [u8] {
+        if self.need_stat.get() {
+            self.need_stat.set(false);
+            // This error can happen if the file was deleted between the time the directory
+            // was scanned and the time it was read
+            // SAFETY: see `Entry::kind` PORT NOTE.
+            match unsafe { &mut *fs }.resolve_kind(self.dir, self.base(), self.cache().fd, store_fd) {
+                Ok(c) => self.cache.set(c),
+                Err(_) => return b"",
+            }
+        }
+        crate::path_string_static(&self.cache().symlink)
+    }
+}
+
+// PORT NOTE: `BSSList::append` requires `ValueType: Clone` (its overflow path
+// retries with a copy). `Mutex`/`StringOrTinyString` aren't `Clone`, but for a
+// freshly-constructed `Entry` (the only thing ever appended) a field-wise copy
+// with a fresh `Mutex` is semantically equivalent to Zig's by-value move.
+impl Clone for Entry {
+    fn clone(&self) -> Self {
+        Self {
+            cache: core::cell::Cell::new(self.cache.get()),
+            dir: self.dir,
+            base_: strings::StringOrTinyString::init(self.base_.slice()),
+            base_lowercase_: strings::StringOrTinyString::init(self.base_lowercase_.slice()),
+            mutex: Mutex::default(),
+            need_stat: core::cell::Cell::new(self.need_stat.get()),
+            abs_path: self.abs_path,
+        }
+    }
+}
+
+impl Default for Entry {
+    fn default() -> Self {
+        Self {
+            cache: core::cell::Cell::new(EntryCache::default()),
+            dir: b"",
+            base_: strings::StringOrTinyString::init(b""),
+            base_lowercase_: strings::StringOrTinyString::init(b""),
+            mutex: Mutex::default(),
+            need_stat: core::cell::Cell::new(true),
+            abs_path: PathString::EMPTY,
+        }
+    }
+}
+
+/// Port of `FileSystem.DirEntry.DifferentCase` in `fs.zig`.
+// PORT NOTE: lifetime-generic, but resolver storage requires `'static` (all
+// three slices borrow DirnameStore/EntryStore-interned data in practice).
+#[derive(Clone, Copy)]
+pub struct DifferentCase<'a> {
+    pub dir: &'a [u8],
+    pub query: &'a [u8],
+    pub actual: &'a [u8],
+}
+
+/// Port of `FileSystem.DirEntry.Lookup` in `fs.zig`.
+// PORT NOTE: `entry` is a RAW `*mut Entry` (matching Zig `*Entry`). A safe
+// `&self → &mut Entry` accessor would let two `get()` calls produce coexisting
+// aliased `&mut Entry` (PORTING.md §Forbidden). Callers `unsafe { &mut *entry }`
+// at each write site under `entries_mutex`.
+pub struct EntryLookup<'a> {
+    pub entry: *mut Entry,
+    pub diff_case: Option<DifferentCase<'static>>,
+    // tie the lookup's nominal lifetime to the DirEntry it came from
+    _marker: core::marker::PhantomData<&'a Entry>,
+}
+
+impl<'a> EntryLookup<'a> {
+    /// Shared borrow of the looked-up `Entry`.
+    ///
+    /// # Safety (encapsulated)
+    /// `self.entry` is a slot in the process-lifetime `EntryStore` BSSMap
+    /// singleton (see `dir_entry::EntryStore`); never freed. `Entry`'s
+    /// only mutable state (`cache`) is behind `Cell`, so interior
+    /// writes via `set_cache*()` do not alias this `&Entry`. The
+    /// `PhantomData<&'a Entry>` ties the borrow to the `DirEntry` it was
+    /// looked up from.
+    #[inline(always)]
+    pub fn entry(&self) -> &'a Entry {
+        // SAFETY: ARENA — EntryStore-owned slot; see fn doc.
+        unsafe { &*self.entry }
+    }
+
+    /// # Safety
+    /// `entry` is an EntryStore-owned slot; caller holds `RealFS.entries_mutex`
+    /// and must not let the returned `&mut Entry` overlap any other live
+    /// reference to this slot.
+    #[inline(always)]
+    pub unsafe fn entry_mut(&self) -> &'a mut Entry {
+        // SAFETY: upheld by caller — see fn doc. `self.entry` is an EntryStore slot.
+        unsafe { &mut *self.entry }
+    }
+}
+
+/// Port of `FileSystem.DirEntry` namespace items (`EntryMap`, `EntryStore`, `Err`).
+pub mod dir_entry {
+    use super::{Entry, EntryStoreBacking};
+
+    /// Port of `DirEntry.EntryMap` (`bun.StringHashMap(*Entry)`).
+    pub type EntryMap = bun_collections::StringHashMap<*mut Entry>;
+
     /// Port of `DirEntry.EntryStore` (`allocators.BSSList<Entry, files>`).
     /// ZST handle resolving to the `entry_store_backing()` singleton.
-    pub(crate) struct EntryStore(());
+    pub struct EntryStore(());
 
     impl EntryStore {
         #[inline]
-        pub(crate) fn instance() -> *mut EntryStoreBacking {
+        pub fn instance() -> *mut EntryStoreBacking {
             // PORT NOTE: returns the raw `*mut` singleton (Zig `*Self`). Do NOT
             // materialize a `&'static mut` here — concurrent callers would alias.
-            entry_store_backing()
+            super::entry_store_backing()
         }
         #[inline]
-        pub(crate) fn append(value: Entry) -> core::result::Result<*mut Entry, AllocError> {
+        pub fn append(value: Entry) -> core::result::Result<*mut Entry, bun_alloc::AllocError> {
             // SAFETY: `instance()` is the live `'static` `bss_list!` singleton.
             // `BSSList::append` takes `*mut Self` and serializes on its own inner
             // mutex (matching Zig `EntryStore.instance.append`); no outer lock.
@@ -504,8 +759,8 @@ pub(crate) mod dir_entry {
         /// writes lower straight into the destination (matching Zig's
         /// result-location semantics).
         #[inline(always)]
-        pub(crate) fn append_uninit()
-            -> core::result::Result<*mut core::mem::MaybeUninit<Entry>, AllocError>
+        pub fn append_uninit()
+            -> core::result::Result<*mut core::mem::MaybeUninit<Entry>, bun_alloc::AllocError>
         {
             // SAFETY: `instance()` is the live `'static` `bss_list!` singleton;
             // `BSSList::append_uninit` takes `*mut Self` and serializes on its
@@ -514,6 +769,7 @@ pub(crate) mod dir_entry {
         }
     }
 
+    /// Port of `DirEntry.Err`.
     #[derive(Clone, Copy)]
     pub struct Err {
         pub original_err: bun_core::Error,
@@ -521,6 +777,25 @@ pub(crate) mod dir_entry {
     }
 }
 
+/// Trait abstraction for the `comptime Iterator: type, iterator: Iterator` pattern
+/// in `addEntry`/`readdir` (Zig used a duck-typed `iterator.next(*Entry, FD)`).
+pub trait DirEntryIterator {
+    const IS_VOID: bool = false;
+    fn next(&self, entry: &mut Entry, fd: Fd);
+}
+
+impl DirEntryIterator for () {
+    const IS_VOID: bool = true;
+    fn next(&self, _entry: &mut Entry, _fd: Fd) {}
+}
+
+impl<T: DirEntryIterator + ?Sized> DirEntryIterator for &T {
+    const IS_VOID: bool = T::IS_VOID;
+    #[inline]
+    fn next(&self, entry: &mut Entry, fd: Fd) { (**self).next(entry, fd) }
+}
+
+/// Port of `FileSystem.DirEntry` in `fs.zig`.
 pub struct DirEntry {
     // TODO(port): rule deviation — Zig deinit calls allocator.free(d.dir) so guide says Box<[u8]>,
     // but this is interned in DirnameStore (a &'static BSSList). Keeping &'static; Phase B revisit.
@@ -531,21 +806,27 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
-    // pub fn remove_entry(dir: &mut DirEntry, name: &[u8]) -> Result<(), bun_core::Error> {
-    //     // dir.data.remove(name);
-    // }
+    pub fn init(dir: &'static [u8], generation: Generation) -> DirEntry {
+        if FeatureFlags::VERBOSE_FS {
+            bun_core::prettyln!("\n  {}", BStr::new(dir));
+        }
+        DirEntry { dir, data: dir_entry::EntryMap::default(), generation, fd: Fd::INVALID }
+    }
 
+    /// Port of `DirEntry.addEntry` in `fs.zig`.
+    // PORT NOTE: Zig signature was `(prev_map, *entry, allocator, comptime Iterator, iterator)`.
+    // The Zig `allocator` param is dropped (everything routes through the global stores).
+    // Compatibility wrapper for callers outside the `readdir` hot loop —
+    // resolves the `FilenameStore` singleton on demand. Hot-loop callers
+    // should hoist `FilenameStoreAppender::new()` once and call
+    // `add_entry_with_store` directly.
     #[inline]
     pub fn add_entry<I: DirEntryIterator>(
         &mut self,
         prev_map: Option<&mut dir_entry::EntryMap>,
         entry: &bun_sys::dir_iterator::IteratorResult,
         iterator: I,
-    ) -> Result<(), bun_core::Error> {
-        // Compatibility wrapper for callers outside the `readdir` hot loop —
-        // resolves the `FilenameStore` singleton on demand. Hot-loop callers
-        // should hoist `FilenameStoreAppender::new()` once and call
-        // `add_entry_with_store` directly.
+    ) -> core::result::Result<(), bun_core::Error> {
         self.add_entry_with_store(prev_map, entry, &mut FilenameStoreAppender::new(), iterator)
     }
 
@@ -555,7 +836,7 @@ impl DirEntry {
         entry: &bun_sys::dir_iterator::IteratorResult,
         filename_store: &mut FilenameStoreAppender,
         iterator: I,
-    ) -> Result<(), bun_core::Error> {
+    ) -> core::result::Result<(), bun_core::Error> {
         use bun_sys::FileKind as DK;
         // `entry.name.slice()` is OS-native (`&[u16]` on Windows); the
         // entry-store / hashmap key in `data` is UTF-8, so use the eagerly-
@@ -601,16 +882,15 @@ impl DirEntry {
                     let _guard = existing.mutex.lock_guard();
                     existing.dir = self.dir;
 
-                    existing.need_stat = existing.need_stat
+                    existing.need_stat.set(existing.need_stat.get()
                         || found_kind.is_none()
-                        || Some(existing.cache.kind) != found_kind;
+                        || Some(existing.cache().kind) != found_kind);
                     // TODO: is this right?
-                    if Some(existing.cache.kind) != found_kind {
+                    if Some(existing.cache().kind) != found_kind {
                         // if found_kind is null, we have set need_stat above, so we
                         // store an arbitrary kind
-                        existing.cache.kind = found_kind.unwrap_or(EntryKind::File);
-
-                        existing.cache.symlink = PathString::EMPTY;
+                        existing.set_cache_kind(found_kind.unwrap_or(EntryKind::File));
+                        existing.set_cache_symlink(PathString::EMPTY);
                     }
                     break 'brk existing_ptr;
                 }
@@ -648,14 +928,14 @@ impl DirEntry {
                 // Call "stat" lazily for performance. The "@material-ui/icons" package
                 // contains a directory with over 11,000 entries in it and running "stat"
                 // for each entry was a big performance issue for that package.
-                addr_of_mut!((*p).need_stat).write(found_kind.is_none());
-                addr_of_mut!((*p).cache).write(EntryCache {
+                addr_of_mut!((*p).need_stat).write(core::cell::Cell::new(found_kind.is_none()));
+                addr_of_mut!((*p).cache).write(core::cell::Cell::new(EntryCache {
                     symlink: PathString::EMPTY,
                     // if found_kind is null, we have set need_stat above, so we
                     // store an arbitrary kind
                     kind: found_kind.unwrap_or(EntryKind::File),
                     fd: Fd::INVALID,
-                });
+                }));
                 addr_of_mut!((*p).abs_path).write(PathString::EMPTY);
                 p
             }
@@ -695,20 +975,11 @@ impl DirEntry {
         Ok(())
     }
 
-    pub fn init(dir: &'static [u8], generation: Generation) -> DirEntry {
-        if FeatureFlags::VERBOSE_FS {
-            bun_core::prettyln!("\n  {}", BStr::new(dir));
-        }
-
-        DirEntry {
-            dir,
-            data: dir_entry::EntryMap::default(),
-            generation,
-            fd: Fd::INVALID,
-        }
-    }
-
-    pub fn get<'a>(&'a self, query_: &'a [u8]) -> Option<EntryLookup<'a>> {
+    /// Port of `DirEntry.get` in `fs.zig`.
+    // PORT NOTE: `query_` borrow detached from the returned Entry lifetime so
+    // callers can pass a slice into the same threadlocal buffer they then
+    // mutate; `DifferentCase` widens to 'static (DirnameStore-backed).
+    pub fn get<'a>(&'a self, query_: &[u8]) -> Option<EntryLookup<'a>> {
         if query_.is_empty() || query_.len() > MAX_PATH_BYTES {
             return None;
         }
@@ -716,31 +987,36 @@ impl DirEntry {
 
         let query = strings::copy_lowercase_if_needed(query_, &mut scratch_lookup_buffer[..]);
         let &result_ptr = self.data.get(query)?;
-        // SAFETY: EntryStore-owned pointer; valid for the lifetime of the store (process-static).
-        let result = unsafe { &*result_ptr };
-        let basename = result.base();
+        // SAFETY: EntryStore-owned pointer, valid for lifetime of store; read-only
+        // borrow here only to compare basename — never overlaps a writer.
+        let basename = unsafe { &*result_ptr }.base();
         if !strings::eql_long(basename, query_, true) {
             return Some(EntryLookup {
                 entry: result_ptr,
                 diff_case: Some(DifferentCase {
                     dir: self.dir,
-                    query: query_,
-                    actual: basename,
+                    // TODO(port): lifetime — Zig stored caller's slice; widened to 'static.
+                    // SAFETY: extended for borrowck reshape; consumed before caller's buffer
+                    // is overwritten (see resolver call sites).
+                    query: unsafe { &*core::ptr::from_ref::<[u8]>(query_) },
+                    // SAFETY: `basename` borrows EntryStore (process-lifetime).
+                    actual: unsafe { &*core::ptr::from_ref::<[u8]>(basename) },
                 }),
+                _marker: core::marker::PhantomData,
             });
         }
 
-        Some(EntryLookup { entry: result_ptr, diff_case: None })
+        Some(EntryLookup { entry: result_ptr, diff_case: None, _marker: core::marker::PhantomData })
     }
 
-    // TODO(port): getComptimeQuery used comptime string lowering + comptime hash; Rust port
-    // takes a &'static [u8] that is already lowercase. Phase B may add a const-eval hash.
+    /// Port of `DirEntry.getComptimeQuery` in `fs.zig`.
+    // PORT NOTE: Zig used comptime string lowering + comptime hash; Rust port
+    // takes a &'static [u8] that is already lowercase.
     pub fn get_comptime_query<'a>(&'a self, query_lower: &'static [u8]) -> Option<EntryLookup<'a>> {
         // PERF(port): was comptime hash precompute — profile in Phase B
         let &result_ptr = self.data.get(query_lower)?;
-        // SAFETY: EntryStore-owned pointer; valid for the lifetime of the store (process-static).
-        let result = unsafe { &*result_ptr };
-        let basename = result.base();
+        // SAFETY: EntryStore-owned pointer; read-only basename compare.
+        let basename = unsafe { &*result_ptr }.base();
 
         if basename != query_lower {
             return Some(EntryLookup {
@@ -748,187 +1024,50 @@ impl DirEntry {
                 diff_case: Some(DifferentCase {
                     dir: self.dir,
                     query: query_lower,
-                    actual: basename,
+                    // SAFETY: `basename` borrows EntryStore (process-lifetime).
+                    actual: unsafe { &*core::ptr::from_ref::<[u8]>(basename) },
                 }),
+                _marker: core::marker::PhantomData,
             });
         }
 
-        Some(EntryLookup { entry: result_ptr, diff_case: None })
+        Some(EntryLookup { entry: result_ptr, diff_case: None, _marker: core::marker::PhantomData })
     }
 
+    /// Port of `DirEntry.hasComptimeQuery` in `fs.zig`.
     pub fn has_comptime_query(&self, query_lower: &'static [u8]) -> bool {
         // PERF(port): was comptime hash precompute — profile in Phase B
         self.data.contains_key(query_lower)
+    }
+
+    /// Zig: `dir_entry.fd` (fs.zig:121) — cached open directory fd, or
+    /// `bun.invalid_fd` when the resolver did not retain it.
+    #[inline] pub fn fd(&self) -> Fd { self.fd }
+
+    /// Zig: `dir_entry.data.iterator()` (fs.zig:117). Yields the raw
+    /// `*mut Entry` value for each cached file (Zig's `EntryMap` value
+    /// type is `*Entry`). Yields `*mut Entry`, NOT `&mut Entry`, because
+    /// the map hands out raw pointers with no exclusivity guarantee;
+    /// callers reborrow at the use site under `entries_mutex`.
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = *mut Entry> + '_ {
+        self.data.values().copied()
     }
 }
 
 // PORT NOTE: Zig `DirEntry.deinit(allocator)` freed `data` (now drops itself) and `dir`
 // (interned in DirnameStore — see field TODO). Body would be empty, so no `impl Drop`.
 
-/// Trait abstraction for the `comptime Iterator: type, iterator: Iterator` pattern in addEntry/readdir.
-pub trait DirEntryIterator {
-    const IS_VOID: bool = false;
-    fn next(&self, entry: &mut Entry, fd: Fd);
-}
-
-impl DirEntryIterator for () {
-    const IS_VOID: bool = true;
-    fn next(&self, _entry: &mut Entry, _fd: Fd) {}
-}
-
-impl<T: DirEntryIterator + ?Sized> DirEntryIterator for &T {
-    const IS_VOID: bool = T::IS_VOID;
+impl bun_dotenv::DirEntryProbe for DirEntry {
     #[inline]
-    fn next(&self, entry: &mut Entry, fd: Fd) { (**self).next(entry, fd) }
-}
-
-pub struct Entry {
-    pub cache: EntryCache,
-    // TODO(port): rule deviation — Zig deinit calls allocator.free(e.dir) so guide says Box<[u8]>,
-    // but this points into DirnameStore (a &'static BSSList). Keeping &'static; Phase B revisit.
-    pub dir: &'static [u8],
-
-    pub base_: strings::StringOrTinyString,
-
-    // Necessary because the hash table uses it as a key
-    pub base_lowercase_: strings::StringOrTinyString,
-
-    pub mutex: Mutex,
-    pub need_stat: bool,
-
-    pub abs_path: PathString,
-}
-
-// PORT NOTE: `BSSList::append` requires `ValueType: Clone` (its overflow path
-// retries with a copy). `Mutex`/`StringOrTinyString` aren't `Clone`, but for a
-// freshly-constructed `Entry` (the only thing ever appended) a field-wise copy
-// with a fresh `Mutex` is semantically equivalent to Zig's by-value move.
-impl Clone for Entry {
-    fn clone(&self) -> Self {
-        Self {
-            cache: self.cache,
-            dir: self.dir,
-            base_: strings::StringOrTinyString::init(self.base_.slice()),
-            base_lowercase_: strings::StringOrTinyString::init(self.base_lowercase_.slice()),
-            mutex: Mutex::default(),
-            need_stat: self.need_stat,
-            abs_path: self.abs_path,
-        }
+    fn has_comptime_query(&self, query_lower: &'static [u8]) -> bool {
+        DirEntry::has_comptime_query(self, query_lower)
     }
 }
 
-impl Default for Entry {
-    fn default() -> Self {
-        Self {
-            cache: EntryCache::default(),
-            dir: b"",
-            base_: strings::StringOrTinyString::init(b""),
-            base_lowercase_: strings::StringOrTinyString::init(b""),
-            mutex: Mutex::default(),
-            need_stat: true,
-            abs_path: PathString::EMPTY,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct DifferentCase<'a> {
-    pub dir: &'a [u8],
-    pub query: &'a [u8],
-    pub actual: &'a [u8],
-}
-
-pub struct EntryLookup<'a> {
-    /// Mutable raw pointer matching Zig `*Entry` — the lazy-stat methods
-    /// `Entry::kind`/`Entry::symlink` need `&mut Entry` to fill `cache`, and
-    /// `Entry` lives in the process-static `EntryStore` (BSSList) so a raw
-    /// pointer is the correct ownership shape (BACKREF/ARENA).
-    pub entry: *mut Entry,
-    pub diff_case: Option<DifferentCase<'a>>,
-}
-
-impl<'a> EntryLookup<'a> {
-    /// Convenience: dereference `entry` as a shared borrow.
-    /// SAFETY: `entry` points into the process-static `EntryStore`; caller must
-    /// not hold a concurrent `&mut` to the same `Entry`.
-    #[inline]
-    pub unsafe fn entry_ref(&self) -> &Entry {
-        // SAFETY: see fn doc
-        unsafe { &*self.entry }
-    }
-    /// Convenience: dereference `entry` as a mutable borrow for the lazy-stat
-    /// path (`kind`/`symlink`).
-    /// SAFETY: `entry` points into the process-static `EntryStore`; caller must
-    /// hold no other borrow to the same `Entry`.
-    #[inline]
-    pub unsafe fn entry_mut(&self) -> &mut Entry {
-        // SAFETY: see fn doc
-        unsafe { &mut *self.entry }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct EntryCache {
-    pub symlink: PathString,
-    /// Too much code expects this to be 0
-    /// don't make it bun.invalid_fd
-    pub fd: Fd,
-    pub kind: EntryKind,
-}
-
-impl Default for EntryCache {
-    fn default() -> Self {
-        Self {
-            symlink: PathString::EMPTY,
-            fd: Fd::INVALID,
-            kind: EntryKind::File,
-        }
-    }
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum EntryKind {
-    Dir,
-    File,
-}
-
-impl Entry {
-    #[inline]
-    pub fn base(&self) -> &[u8] {
-        self.base_.slice()
-    }
-
-    #[inline]
-    pub fn base_lowercase(&self) -> &[u8] {
-        self.base_lowercase_.slice()
-    }
-
-    pub fn kind(&mut self, fs: &mut Implementation, store_fd: bool) -> EntryKind {
-        if self.need_stat {
-            self.need_stat = false;
-            // This is technically incorrect, but we are choosing not to handle errors here
-            match fs.kind(self.dir, self.base(), self.cache.fd, store_fd) {
-                Ok(c) => self.cache = c,
-                Err(_) => return self.cache.kind,
-            }
-        }
-        self.cache.kind
-    }
-
-    pub fn symlink(&mut self, fs: &mut Implementation, store_fd: bool) -> &[u8] {
-        if self.need_stat {
-            self.need_stat = false;
-            // This is technically incorrect, but we are choosing not to handle errors here
-            // This error can happen if the file was deleted between the time the directory was scanned and the time it was read
-            match fs.kind(self.dir, self.base(), self.cache.fd, store_fd) {
-                Ok(c) => self.cache = c,
-                Err(_) => return b"",
-            }
-        }
-        self.cache.symlink.slice()
-    }
-}
+/// Compat re-exports for callers that named the seam-type aliases.
+pub use EntryKind as FsEntryKind;
+pub use dir_entry::Err as DirEntryErr;
 
 // TODO(port): Entry::deinit took allocator and destroyed self; Entry lives in EntryStore (BSSList) so no Drop needed
 
@@ -2626,6 +2765,19 @@ pub(crate) type Implementation = RealFS;
 // .wasi, .native => RealFS,
 //     .wasm => WasmFS,
 // };
+
+impl EntryKindResolver for RealFS {
+    #[inline(always)]
+    fn resolve_kind(
+        &mut self,
+        dir: &[u8],
+        base: &[u8],
+        existing_fd: Fd,
+        store_fd: bool,
+    ) -> core::result::Result<EntryCache, bun_core::Error> {
+        self.kind(dir, base, existing_fd, store_fd)
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 
