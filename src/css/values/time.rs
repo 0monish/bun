@@ -116,18 +116,13 @@ impl Time {
 
     pub fn try_from_token(token: &Token) -> Maybe<Time, ()> {
         match token {
-            Token::Dimension(dim) => {
-                // todo_stuff.match_ignore_ascii_case
-                if bun_string::strings::eql_case_insensitive_ascii_check_length(b"s", dim.unit) {
-                    return Ok(Time::Seconds(dim.num.value));
-                } else if bun_string::strings::eql_case_insensitive_ascii_check_length(b"ms", dim.unit) {
-                    return Ok(Time::Milliseconds(dim.num.value));
-                }
-            }
-            _ => {}
+            Token::Dimension(dim) => crate::match_ignore_ascii_case! { dim.unit, {
+                b"s" => Ok(Time::Seconds(dim.num.value)),
+                b"ms" => Ok(Time::Milliseconds(dim.num.value)),
+                _ => Err(()),
+            }},
+            _ => Err(()),
         }
-
-        Err(())
     }
 
     pub fn try_from_angle(_: Angle) -> Option<Self> {
