@@ -925,7 +925,7 @@ macro_rules! impl_fs_argument {
     };
 }
 impl_fs_argument!(
-    args::Rename, args::Truncate, args::Writev, args::Readv, args::FTruncate,
+    args::Rename, args::Truncate, args::FdVectorIo, args::FTruncate,
     args::Chown, args::Lutimes, args::Chmod,
     args::StatFS, args::Stat, args::Link, args::Symlink,
     args::Readlink, args::Realpath, args::Unlink, args::RmDir, args::Mkdir,
@@ -2457,23 +2457,29 @@ pub mod args {
         }
     }
 
-    pub struct Writev {
+    /// Shared layout for `fs.writev` / `fs.readv` arguments. Zig keeps two
+    /// byte-identical copy-pasted structs (`Arguments.Writev` / `Arguments.Readv`,
+    /// node_fs.zig:1364-1468); we keep one concrete struct and re-export both
+    /// names as type aliases so every `args::Writev` / `args::Readv` caller
+    /// (UVFSRequest params, `readv`/`writev`/`preadv_inner`/`pwritev_inner`,
+    /// uv dispatch arms) is untouched.
+    pub struct FdVectorIo {
         pub fd: FD,
         pub buffers: VectorArrayBuffer,
         pub position: Option<u64>, // u52
     }
-    impl Unprotect for Writev {
+    impl Unprotect for FdVectorIo {
         #[inline] fn unprotect(&mut self) {
             self.buffers.value.unprotect();
             // Zig: `self.buffers.buffers.deinit()` — `Vec` frees on drop.
         }
     }
-    impl Writev {
+    impl FdVectorIo {
         pub fn to_thread_safe(&mut self) {
             self.buffers.value.protect();
             self.buffers.buffers = self.buffers.buffers.as_slice().to_vec();
         }
-        pub fn from_js(ctx: &JSGlobalObject, arguments: &mut ArgumentsSlice) -> JsResult<Writev> {
+        pub fn from_js(ctx: &JSGlobalObject, arguments: &mut ArgumentsSlice) -> JsResult<Self> {
             let fd = FD::from_js_required(ctx, arguments)?;
             let buffers = VectorArrayBuffer::from_js(
                 ctx,
@@ -2489,45 +2495,11 @@ pub mod args {
                     }
                 }
             }
-            Ok(Writev { fd, buffers, position })
+            Ok(Self { fd, buffers, position })
         }
     }
-
-    pub struct Readv {
-        pub fd: FD,
-        pub buffers: VectorArrayBuffer,
-        pub position: Option<u64>, // u52
-    }
-    impl Unprotect for Readv {
-        #[inline] fn unprotect(&mut self) {
-            self.buffers.value.unprotect();
-            // Zig: `self.buffers.buffers.deinit()` — `Vec` frees on drop.
-        }
-    }
-    impl Readv {
-        pub fn to_thread_safe(&mut self) {
-            self.buffers.value.protect();
-            self.buffers.buffers = self.buffers.buffers.as_slice().to_vec();
-        }
-        pub fn from_js(ctx: &JSGlobalObject, arguments: &mut ArgumentsSlice) -> JsResult<Readv> {
-            let fd = FD::from_js_required(ctx, arguments)?;
-            let buffers = VectorArrayBuffer::from_js(
-                ctx,
-                arguments.protect_eat_next().ok_or_else(|| ctx.throw_invalid_arguments(format_args!("Expected an ArrayBufferView[]")))?,
-            )?;
-            let mut position: Option<u64> = None;
-            if let Some(pos_value) = arguments.next_eat() {
-                if !pos_value.is_undefined_or_null() {
-                    if pos_value.is_number() {
-                        position = Some(pos_value.to_int64() as u64);
-                    } else {
-                        return Err(ctx.throw_invalid_arguments(format_args!("position must be a number")));
-                    }
-                }
-            }
-            Ok(Readv { fd, buffers, position })
-        }
-    }
+    pub type Writev = FdVectorIo;
+    pub type Readv = FdVectorIo;
 
     pub struct FTruncate {
         pub fd: FD,
@@ -2836,16 +2808,7 @@ pub mod args {
     impl Readlink {
         pub fn from_js(ctx: &JSGlobalObject, arguments: &mut ArgumentsSlice) -> JsResult<Readlink> {
             let path = PathLike::from_js_required(ctx, arguments, "path")?;
-            let mut encoding = Encoding::Utf8;
-            if let Some(val) = arguments.next() {
-                arguments.eat();
-                match val.js_type() {
-                    bun_jsc::JSType::String | bun_jsc::JSType::StringObject | bun_jsc::JSType::DerivedStringObject => {
-                        encoding = Encoding::assert(val, ctx, encoding)?;
-                    }
-                    _ => if val.is_object() { encoding = get_encoding(val, ctx, encoding)?; }
-                }
-            }
+            let encoding = parse_encoding_arg(ctx, arguments, Encoding::Utf8)?;
             Ok(Readlink { path, encoding })
         }
     }
@@ -2858,16 +2821,7 @@ pub mod args {
     impl Realpath {
         pub fn from_js(ctx: &JSGlobalObject, arguments: &mut ArgumentsSlice) -> JsResult<Realpath> {
             let path = PathLike::from_js_required(ctx, arguments, "path")?;
-            let mut encoding = Encoding::Utf8;
-            if let Some(val) = arguments.next() {
-                arguments.eat();
-                match val.js_type() {
-                    bun_jsc::JSType::String | bun_jsc::JSType::StringObject | bun_jsc::JSType::DerivedStringObject => {
-                        encoding = Encoding::assert(val, ctx, encoding)?;
-                    }
-                    _ => if val.is_object() { encoding = get_encoding(val, ctx, encoding)?; }
-                }
-            }
+            let encoding = parse_encoding_arg(ctx, arguments, Encoding::Utf8)?;
             Ok(Realpath { path, encoding })
         }
     }
@@ -2877,6 +2831,29 @@ pub mod args {
             return Encoding::assert(value, global_object, default);
         }
         Ok(default)
+    }
+
+    /// Consume the next positional argument as a Node.js fs `encoding` option.
+    /// Accepts either an encoding string (`"utf8"`, `"buffer"`, ...) or an options
+    /// object with an `.encoding` property. Any other value (including `undefined`
+    /// / `null` / numbers / functions) is silently ignored and `default` is returned.
+    /// Mirrors the copy-pasted block in Zig's `Readlink/Realpath/MkdirTemp.fromJS`.
+    pub(super) fn parse_encoding_arg(
+        ctx: &JSGlobalObject,
+        arguments: &mut ArgumentsSlice,
+        default: Encoding,
+    ) -> JsResult<Encoding> {
+        let mut encoding = default;
+        if let Some(val) = arguments.next() {
+            arguments.eat();
+            match val.js_type() {
+                bun_jsc::JSType::String | bun_jsc::JSType::StringObject | bun_jsc::JSType::DerivedStringObject => {
+                    encoding = Encoding::assert(val, ctx, encoding)?;
+                }
+                _ => if val.is_object() { encoding = get_encoding(val, ctx, encoding)?; }
+            }
+        }
+        Ok(encoding)
     }
 
     pub struct Unlink {
@@ -2988,16 +2965,7 @@ pub mod args {
             let prefix = PathLike::from_js(ctx, arguments)?.ok_or_else(|| {
                 ctx.throw_invalid_argument_type_value(b"prefix", b"string, Buffer, or URL", arguments.next().unwrap_or(JSValue::UNDEFINED))
             })?;
-            let mut encoding = Encoding::Utf8;
-            if let Some(val) = arguments.next() {
-                arguments.eat();
-                match val.js_type() {
-                    bun_jsc::JSType::String | bun_jsc::JSType::StringObject | bun_jsc::JSType::DerivedStringObject => {
-                        encoding = Encoding::assert(val, ctx, encoding)?;
-                    }
-                    _ => if val.is_object() { encoding = get_encoding(val, ctx, encoding)?; }
-                }
-            }
+            let encoding = parse_encoding_arg(ctx, arguments, Encoding::Utf8)?;
             Ok(MkdirTemp { prefix, encoding })
         }
     }
@@ -4366,11 +4334,7 @@ impl NodeFS {
         #[cfg(windows)]
         {
             let mut dest_buf = paths::os_path_buffer_pool::get();
-            // SAFETY: `sync_error_buf` is `align(@alignOf(u16))` (see field decl);
-            // reinterpreting the byte buffer as `&mut [u16]` is the documented
-            // pattern for the Windows wide-path scratch (matches Zig
-            // `@ptrCast(@alignCast(&this.sync_error_buf))`).
-            let src = strings::to_kernel32_path(unsafe { bun_core::reinterpret_slice::<u16>(&mut self.sync_error_buf) }, args.src.slice());
+            let src = strings::to_kernel32_path(bun_core::cast_slice_mut::<u8, u16>(&mut self.sync_error_buf), args.src.slice());
             let dest = strings::to_kernel32_path(&mut *dest_buf, args.dest.slice());
             // SAFETY: src/dest are NUL-terminated wide paths; CopyFileW is the Win32 FFI
             if unsafe { windows::CopyFileW(src.as_ptr(), dest.as_ptr(), if args.mode.shouldnt_overwrite() { 1 } else { 0 }) } == windows::FALSE {
@@ -4603,10 +4567,6 @@ impl NodeFS {
         }
     }
 
-    pub fn _is_sep(ch: OSPathChar) -> bool {
-        if cfg!(windows) { ch == b'/' as OSPathChar || ch == b'\\' as OSPathChar } else { ch == b'/' as OSPathChar }
-    }
-
     pub fn mkdir_recursive_os_path(&mut self, path: &OSPathSliceZ, mode: Mode, return_path: bool) -> Maybe<ret::Mkdir> {
         // PERF(port): was comptime bool — runtime branch here
         if return_path {
@@ -4691,7 +4651,7 @@ impl NodeFS {
 
         // iterate backwards until creating the directory works successfully
         while i > 0 {
-            if Self::_is_sep((&path[..])[i as usize]) {
+            if bun_paths::is_sep_native_t::<OSPathChar>((&path[..])[i as usize]) {
                 working_mem[i as usize] = 0;
                 let parent = unsafe { OSPathSliceZ::from_raw(working_mem.as_ptr(), i as usize) };
                 match mkdir_os_path(parent, mode) {
@@ -4763,7 +4723,7 @@ impl NodeFS {
         i += 1;
         // after we find one that works, we go forward _after_ the first working directory
         while i < len {
-            if Self::_is_sep((&path[..])[i as usize]) {
+            if bun_paths::is_sep_native_t::<OSPathChar>((&path[..])[i as usize]) {
                 working_mem[i as usize] = 0;
                 let parent = unsafe { OSPathSliceZ::from_raw(working_mem.as_ptr(), i as usize) };
                 match mkdir_os_path(parent, mode) {
