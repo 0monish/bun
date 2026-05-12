@@ -99,19 +99,29 @@ impl Default for ListValue {
     }
 }
 
+/// Dispatch a single body over both `ListValue` arms — Rust's spelling of Zig's
+/// `switch (this.impl) { inline else => |*list| ... }`. `$body` is duplicated
+/// textually so each arm monomorphizes over its own `MultiArrayList<T>`; the
+/// arms therefore need NOT have a common element type, only a common `$body`
+/// result type. Match-ergonomics governs the borrow: pass `&v` / `&mut v` and
+/// `$l` binds by-ref / by-ref-mut accordingly. Mirrors `any_dispatch!` at
+/// src/uws_sys/Response.rs:581.
+macro_rules! both_lists {
+    ($v:expr, |$l:ident| $body:expr) => {
+        match $v {
+            ListValue::WithoutNames($l) => $body,
+            ListValue::WithNames($l) => $body,
+        }
+    };
+}
+
 impl ListValue {
     pub fn memory_cost(&self) -> usize {
-        match self {
-            ListValue::WithoutNames(list) => list.memory_cost(),
-            ListValue::WithNames(list) => list.memory_cost(),
-        }
+        both_lists!(self, |list| list.memory_cost())
     }
 
     pub fn ensure_total_capacity(&mut self, count: usize) -> Result<(), bun_alloc::AllocError> {
-        match self {
-            ListValue::WithoutNames(list) => list.ensure_total_capacity(count),
-            ListValue::WithNames(list) => list.ensure_total_capacity(count),
-        }
+        both_lists!(self, |list| list.ensure_total_capacity(count))
     }
 }
 
@@ -183,24 +193,11 @@ impl List {
     }
 
     pub fn find_index(&self, line: Ordinal, column: Ordinal) -> Option<usize> {
-        match &self.r#impl {
-            ListValue::WithoutNames(list) => {
-                if let Some(i) =
-                    Self::find_index_from_generated(list.items_generated(), line, column)
-                {
-                    return Some(i);
-                }
-            }
-            ListValue::WithNames(list) => {
-                if let Some(i) =
-                    Self::find_index_from_generated(list.items_generated(), line, column)
-                {
-                    return Some(i);
-                }
-            }
-        }
-
-        None
+        both_lists!(&self.r#impl, |list| Self::find_index_from_generated(
+            list.items_generated(),
+            line,
+            column,
+        ))
     }
 
     pub fn sort(&mut self) {
@@ -208,28 +205,16 @@ impl List {
         // `&self` (it swaps via raw column ptrs internally), so the `generated` column
         // borrow does not conflict. The `Slice` is captured by-value so its lifetime
         // is detached from `list`.
-        match &self.r#impl {
-            ListValue::WithoutNames(list) => {
-                // SAFETY: column borrow is read-only; `sort` swaps via raw ptrs.
-                let generated = unsafe {
-                    core::slice::from_raw_parts(
-                        list.items_raw::<"generated", LineColumnOffset>(),
-                        list.len(),
-                    )
-                };
-                list.sort(SortContext { generated });
-            }
-            ListValue::WithNames(list) => {
-                // SAFETY: see above.
-                let generated = unsafe {
-                    core::slice::from_raw_parts(
-                        list.items_raw::<"generated", LineColumnOffset>(),
-                        list.len(),
-                    )
-                };
-                list.sort(SortContext { generated });
-            }
-        }
+        both_lists!(&self.r#impl, |list| {
+            // SAFETY: column borrow is read-only; `sort` swaps via raw ptrs.
+            let generated = unsafe {
+                core::slice::from_raw_parts(
+                    list.items_raw::<"generated", LineColumnOffset>(),
+                    list.len(),
+                )
+            };
+            list.sort(SortContext { generated });
+        })
     }
 
     pub fn append(&mut self, mapping: &Mapping) -> Result<(), bun_alloc::AllocError> {
@@ -270,24 +255,15 @@ impl List {
     }
 
     pub fn generated(&self) -> &[LineColumnOffset] {
-        match &self.r#impl {
-            ListValue::WithoutNames(list) => list.items_generated(),
-            ListValue::WithNames(list) => list.items_generated(),
-        }
+        both_lists!(&self.r#impl, |list| list.items_generated())
     }
 
     pub fn original(&self) -> &[LineColumnOffset] {
-        match &self.r#impl {
-            ListValue::WithoutNames(list) => list.items_original(),
-            ListValue::WithNames(list) => list.items_original(),
-        }
+        both_lists!(&self.r#impl, |list| list.items_original())
     }
 
     pub fn source_index(&self) -> &[i32] {
-        match &self.r#impl {
-            ListValue::WithoutNames(list) => list.items_source_index(),
-            ListValue::WithNames(list) => list.items_source_index(),
-        }
+        both_lists!(&self.r#impl, |list| list.items_source_index())
     }
 
     pub fn name_index(&self) -> &[i32] {
